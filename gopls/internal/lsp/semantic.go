@@ -14,6 +14,7 @@ import (
 	"go/types"
 	"log"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -165,12 +166,14 @@ const (
 	tokInterface tokenType = "interface"
 	tokTypeParam tokenType = "typeParameter"
 	tokParameter tokenType = "parameter"
+	tokProperty  tokenType = "property"
 	tokVariable  tokenType = "variable"
 	tokMethod    tokenType = "method"
 	tokFunction  tokenType = "function"
 	tokKeyword   tokenType = "keyword"
 	tokComment   tokenType = "comment"
 	tokString    tokenType = "string"
+	tokRegexp    tokenType = "regexp"
 	tokNumber    tokenType = "number"
 	tokOperator  tokenType = "operator"
 
@@ -300,12 +303,27 @@ func (e *encoded) inspector(n ast.Node) bool {
 			e.multiline(x.Pos(), x.End(), x.Value, tokString)
 			break
 		}
-		ln := len(x.Value)
+		// ln := len(x.Value)
 		what := tokNumber
 		if x.Kind == token.STRING {
 			what = tokString
 		}
-		e.token(x.Pos(), ln, what, nil)
+
+		file := e.fset.File(x.Pos())
+		position := e.fset.Position(x.Pos())
+		r := regexp.MustCompile(`(%((\d)?\[(\d)*\](\*)?)*(b|c|d|e|E|f|F|g|G|o|O|p|q|s|x|X|U|v))|(%(\+|-|#| |0)?(b|c|d|e|E|f|F|g|G|o|O|p|q|s|x|X|U|v))|(%(\d)*(.)?(\d)?(f))`)
+		offset := 0
+		for _, match := range r.FindAllString(x.Value, -1) {
+			index := strings.Index(x.Value[offset:], match)
+			ln := len(x.Value[offset : offset+index])
+			e.token(file.Pos(position.Offset+offset), ln, what, nil)
+			e.token(file.Pos(position.Offset+offset+ln), len(match), tokRegexp, nil)
+			offset = offset + index + len(match)
+		}
+
+		e.token(file.Pos(position.Offset+offset), len(x.Value[offset:]), what, nil)
+
+		// e.token(x.Pos(), ln, what, nil)
 	case *ast.BinaryExpr:
 		e.token(x.OpPos, len(x.Op.String()), tokOperator, nil)
 	case *ast.BlockStmt:
@@ -503,6 +521,9 @@ func (e *encoded) ident(x *ast.Ident) {
 		// can this happen? Don't think so
 		e.unexpected(fmt.Sprintf("%s %T %#v", x.String(), tt, tt))
 	case *types.Func:
+		if e.isArg(x.End()) || e.isProperty(x.Pos()) || e.hasGenerics(x.Pos()) {
+			tok(x.Pos(), len(x.Name), tokMethod, nil)
+		}
 		tok(x.Pos(), len(x.Name), tokFunction, nil)
 	case *types.Label:
 		// nothing to map it to
@@ -516,7 +537,7 @@ func (e *encoded) ident(x *ast.Ident) {
 		if _, ok := y.Type().(*types.Basic); ok {
 			mods = []string{"defaultLibrary"}
 		} else if _, ok := y.Type().(*typeparams.TypeParam); ok {
-			tok(x.Pos(), len(x.String()), tokTypeParam, mods)
+			tok(x.Pos(), len(x.String()), tokType, mods)
 			break
 		}
 		tok(x.Pos(), len(x.String()), tokType, mods)
@@ -529,6 +550,10 @@ func (e *encoded) ident(x *ast.Ident) {
 			// variable, unless use.pos is the pos of a Field in an ancestor FuncDecl
 			// or FuncLit and then it's a parameter
 			tok(x.Pos(), len(x.Name), tokParameter, nil)
+		} else if y.IsField() {
+			tok(x.Pos(), len(x.Name), tokProperty, nil)
+		} else if e.isReceiver(x.Name) {
+			tok(x.Pos(), len(x.Name), tokVariable, []string{"declaration"})
 		} else {
 			tok(x.Pos(), len(x.Name), tokVariable, nil)
 		}
@@ -564,6 +589,70 @@ func (e *encoded) isParam(pos token.Pos) bool {
 					if id.Pos() == pos {
 						return true
 					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (e *encoded) isArg(end token.Pos) bool {
+	for i := len(e.stack) - 1; i >= 0; i-- {
+		switch n := e.stack[i].(type) {
+		case *ast.CallExpr:
+			for _, a := range n.Args {
+				if a.End() == end {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (e *encoded) isProperty(pos token.Pos) bool {
+	for i := len(e.stack) - 1; i >= 0; i-- {
+		switch n := e.stack[i].(type) {
+		case *ast.KeyValueExpr:
+			if n.Value.Pos() == pos {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (e *encoded) isReceiver(name string) bool {
+	for i := len(e.stack) - 1; i >= 0; i-- {
+		switch n := e.stack[i].(type) {
+		case *ast.FuncDecl:
+			if n.Recv == nil {
+				continue
+			}
+			for _, a := range n.Recv.List {
+				for _, n := range a.Names {
+					if n.Name == name {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (e *encoded) hasGenerics(pos token.Pos) bool {
+	for i := len(e.stack) - 1; i >= 0; i-- {
+		switch n := e.stack[i].(type) {
+		case *ast.IndexExpr:
+			switch f := n.X.(type) {
+			case *ast.SelectorExpr:
+				if f.Sel.Pos() == pos {
+					return true
+				}
+			case *ast.Ident:
+				if f.Pos() == pos {
+					return true
 				}
 			}
 		}
@@ -782,7 +871,7 @@ func (e *encoded) definitionFor(x *ast.Ident, def types.Object) (tokenType, []st
 				if len(fld.Names) == 0 {
 					return tokType, nil
 				}
-				return tokVariable, mods
+				return tokProperty, mods
 			}
 			return tokType, mods
 		}
@@ -896,11 +985,12 @@ func (e *encoded) Data() []uint32 {
 }
 
 func (e *encoded) importSpec(d *ast.ImportSpec) {
+	def := []string{"definition"}
 	// a local package name or the last component of the Path
 	if d.Name != nil {
 		nm := d.Name.String()
 		if nm != "_" && nm != "." {
-			e.token(d.Name.Pos(), len(nm), tokNamespace, nil)
+			e.token(d.Name.Pos(), len(nm), tokNamespace, def)
 		}
 		return // don't mark anything for . or _
 	}
@@ -922,7 +1012,7 @@ func (e *encoded) importSpec(d *ast.ImportSpec) {
 	}
 	// Report virtual declaration at the position of the substring.
 	start := d.Path.Pos() + token.Pos(j)
-	e.token(start, len(imported.Name()), tokNamespace, nil)
+	e.token(start, len(imported.Name()), tokNamespace, def)
 }
 
 // log unexpected state
